@@ -8,7 +8,7 @@ weight map. The core workflow is:
 
 1. If a mask is supplied, apodize the target and template-construction maps in
    pixel space before any harmonic preprocessing.
-2. Smooth target and template-construction maps to a common beam.
+2. Match target and template-construction maps to a common Gaussian output beam.
 3. Optionally apply harmonic filtering in `ell` and `m`.
 4. Build foreground templates from map differences such as `353 - 217`.
 5. Estimate template amplitudes with a weighted normal equation.
@@ -94,6 +94,7 @@ Module responsibilities:
 
 - Difference-template construction for split maps such as dust or synchrotron
 - Common-beam matching from input `fwhm_in` to output `fwhm_out`
+- Optional custom input beam windows `B_ell` that replace Gaussian `fwhm_in`
 - Optional pre-harmonic masking for apodized sky cuts
 - Optional harmonic filtering in both `ell` and `m`
 - Public helpers for reusable explicit `ell` and `m` filter arrays
@@ -108,6 +109,17 @@ Module responsibilities:
 
 - Maps are Healpix Q/U polarization maps.
 - Beam widths are given in radians.
+- The output FWHM, and every input FWHM used for Gaussian beam matching, must
+  be finite and nonnegative.
+- Custom beam windows are real, finite, strictly positive, axisymmetric
+  alm-amplitude transfer functions indexed by `ell`. They are applied equally
+  to E and B, are not power-spectrum windows `B_ell**2`, and are used as
+  supplied without automatic normalization.
+- Separate E/B responses, asymmetric or `m`-dependent beams, and cross-polar
+  response are not supported by this first custom-beam interface.
+- Every map in one preprocessing operation uses one common harmonic `lmax`: the
+  unique explicit `HarmonicFilter.lmax`, or `3 * nside - 1` when none is set.
+  Beam and explicit filter arrays must cover that support.
 - Template maps are built as a difference of two Q/U maps after smoothing to a
   common resolution.
 - Noise covariance is provided per pixel in the order `QQ`, `UU`, `QU`.
@@ -184,6 +196,7 @@ filter_config = ftf.HarmonicFilter(
 result = ftf.fit_foreground_templates(
     target_qu=target_qu,
     target_fwhm_in=target_fwhm_rad,
+    # Optional: target_beam_window=target_beam_b_ell,
     template_inputs=[dust_split_a, sync_split_a],
     template_inputs_rhs=[dust_split_b, sync_split_b],
     weight_map=weight_map,
@@ -364,6 +377,24 @@ through `template_inputs` and the independent right-hand split through
 `template_inputs_rhs`. To additionally decouple the data-projection vector
 `d_3^T W m`, pass a third split through `template_inputs_data`; when omitted it
 defaults to the left-hand stack.
+
+If an input map has a non-Gaussian beam, pass its beam transfer function through
+`target_beam_window` for the target or `beam_window_a` / `beam_window_b` on the
+corresponding `DifferenceTemplateInput`. The supplied `B_ell` replaces that
+map's Gaussian `fwhm_in`; the fitted maps still share the Gaussian output beam
+defined by `fwhm_out`. This v1 window is a real, positive, axisymmetric
+alm-amplitude response applied identically to E and B, not a power-spectrum
+window `B_ell**2`.
+
+One operation resolves one common `lmax` across the target and every left,
+right, and data-projection template input. Conflicting explicit values raise an
+error; without an explicit value, the map-native `3 * nside - 1` is used.
+Custom beams and explicit `ell`/`m` filters shorter than `lmax + 1` are rejected
+rather than silently lowering the bandlimit. If any participating map requires
+beam matching, filtering, or an explicit bandlimit, every participating map is
+sent through the same SHT bandlimit so that pixel-space differences do not mix
+different harmonic operators. Non-finite combined beam/filter transfers are
+rejected before transforming rather than allowed to produce invalid maps.
 
 A more detailed API reference is available in [`docs/api.md`](./docs/api.md).
 

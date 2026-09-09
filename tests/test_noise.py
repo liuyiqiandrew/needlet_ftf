@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import fg_weighted_template_fit as ftf
+import fg_weighted_template_fit._filters as filters_mod
 import fg_weighted_template_fit._noise as noise_mod
 
 
@@ -175,6 +176,56 @@ def test_fit_and_bootstrap_store_mc_amplitudes() -> None:
     assert np.all(bootstrap.amplitude_std > 0.0)
 
 
+@pytest.mark.skipif(filters_mod.hp is None, reason="healpy not installed")
+def test_bootstrap_template_amplitudes_runs_real_custom_beam_pipeline() -> None:
+    """Run reference and Monte Carlo fits through real custom-beam transforms."""
+
+    nside = 1
+    npix = 12 * nside**2
+    amplitude = 1.4
+    rng = np.random.default_rng(811)
+    template_map = rng.standard_normal((2, npix))
+    zero_covariance = np.zeros((3, npix), dtype=np.float64)
+    beam_window = np.array([1.0, 0.95, 0.85])
+    filter_config = ftf.HarmonicFilter(lmax=2, iter=5)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=template_map,
+        map_b_qu=np.zeros_like(template_map),
+        fwhm_in_a=np.nan,
+        fwhm_in_b=0.0,
+        noise_cov_a=zero_covariance,
+        noise_cov_b=zero_covariance,
+        filter_config=filter_config,
+        name="dust",
+        beam_window_a=beam_window,
+    )
+
+    result = ftf.bootstrap_template_amplitudes(
+        target_qu=amplitude * template_map,
+        target_noise_cov=zero_covariance,
+        target_fwhm_in=np.nan,
+        target_beam_window=beam_window,
+        template_inputs=(template_input,),
+        weight_map=np.ones(npix),
+        fwhm_out=0.0,
+        n_mc=2,
+        target_filter=filter_config,
+        rng=123,
+    )
+
+    np.testing.assert_allclose(
+        result.reference_fit.amplitudes,
+        [amplitude],
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        result.amplitude_samples,
+        amplitude,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(result.amplitude_std, 0.0, atol=1.0e-12)
+
+
 def test_bootstrap_template_amplitudes_multi_mask_uses_shared_draws() -> None:
     """Reuse each noisy realization across every named fitting mask."""
 
@@ -240,6 +291,100 @@ def test_bootstrap_template_amplitudes_multi_mask_uses_shared_draws() -> None:
     np.testing.assert_allclose(first.amplitude_samples, second.amplitude_samples)
     np.testing.assert_allclose(first.amplitude_mean, second.amplitude_mean)
     np.testing.assert_allclose(first.amplitude_std, second.amplitude_std)
+
+
+def test_bootstrap_template_amplitudes_multi_mask_threads_custom_beams(
+    monkeypatch,
+) -> None:
+    """Forward custom beam windows through paired multi-mask bootstrap draws."""
+
+    npix = 5
+    target = np.ones((2, npix), dtype=np.float64)
+    target_noise_cov = np.zeros((3, npix), dtype=np.float64)
+    target_beam = np.linspace(1.0, 1.2, 4)
+    template_beam = np.linspace(1.0, 1.3, 4)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=target,
+        map_b_qu=np.zeros_like(target),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        noise_cov_a=np.zeros((3, npix), dtype=np.float64),
+        noise_cov_b=np.zeros((3, npix), dtype=np.float64),
+        name="dust",
+        beam_window_a=template_beam,
+    )
+    calls: list[tuple[np.ndarray | None, np.ndarray | None]] = []
+
+    def _weighted_fit(processed_target, processed_template):
+        return ftf.WeightedFitResult(
+            amplitudes=np.array([1.0], dtype=np.float64),
+            normal_matrix=np.ones((1, 1), dtype=np.float64),
+            normal_matrix_inverse=np.ones((1, 1), dtype=np.float64),
+            rhs=np.ones(1, dtype=np.float64),
+            residual_qu=np.zeros_like(processed_target),
+            processed_target_qu=processed_target,
+            processed_templates_qu=processed_template[None, :, :],
+            processed_templates_rhs_qu=processed_template[None, :, :],
+            processed_templates_data_qu=processed_template[None, :, :],
+            template_names=("dust",),
+            solver="solve",
+        )
+
+    def fake_fit_foreground_templates_multi_mask(**kwargs):
+        calls.append(
+            (
+                None
+                if kwargs["target_beam_window"] is None
+                else np.asarray(kwargs["target_beam_window"]),
+                None
+                if kwargs["template_inputs"][0].beam_window_a is None
+                else np.asarray(kwargs["template_inputs"][0].beam_window_a),
+            )
+        )
+        processed_target = np.asarray(kwargs["target_qu"], dtype=np.float64)
+        processed_template = np.asarray(
+            kwargs["template_inputs"][0].map_a_qu,
+            dtype=np.float64,
+        )
+        fit_results = {
+            "m1": _weighted_fit(processed_target, processed_template),
+            "m2": _weighted_fit(processed_target, processed_template),
+        }
+        return ftf.MultiMaskFitResult(
+            fit_names=("m1", "m2"),
+            fit_results=fit_results,
+            template_names=("dust",),
+            processed_target_qu=processed_target,
+            processed_templates_qu=processed_template[None, :, :],
+            processed_templates_rhs_qu=processed_template[None, :, :],
+            processed_templates_data_qu=processed_template[None, :, :],
+        )
+
+    monkeypatch.setattr(
+        noise_mod,
+        "fit_foreground_templates_multi_mask",
+        fake_fit_foreground_templates_multi_mask,
+    )
+
+    result = ftf.bootstrap_template_amplitudes_multi_mask(
+        target_qu=target,
+        target_noise_cov=target_noise_cov,
+        target_fwhm_in=10.0,
+        target_beam_window=target_beam,
+        template_inputs=(template_input,),
+        weight_maps={"m1": np.ones(npix), "m2": np.ones(npix)},
+        fwhm_out=0.0,
+        n_mc=3,
+        master_mask=np.ones(npix),
+        rng=1234,
+        n_jobs=2,
+    )
+
+    assert result.amplitude_samples.shape == (3, 2, 1)
+    assert len(calls) == 4
+    for target_beam_seen, template_beam_seen in calls:
+        np.testing.assert_allclose(target_beam_seen, target_beam)
+        np.testing.assert_allclose(template_beam_seen, template_beam)
 
 
 def test_bootstrap_template_amplitudes_show_progress_uses_tqdm(monkeypatch) -> None:
@@ -348,6 +493,82 @@ def test_bootstrap_template_amplitudes_threaded_returns_valid_samples() -> None:
     assert np.all(np.isfinite(result.amplitude_samples))
     assert np.all(np.isfinite(result.amplitude_mean))
     assert np.all(np.isfinite(result.amplitude_std))
+
+
+def test_bootstrap_template_amplitudes_threads_custom_beams(monkeypatch) -> None:
+    """Forward target and template beam windows through reference and draw fits."""
+
+    npix = 5
+    target = np.ones((2, npix), dtype=np.float64)
+    target_noise_cov = np.zeros((3, npix), dtype=np.float64)
+    target_beam = np.linspace(1.0, 1.2, 4)
+    template_beam = np.linspace(1.0, 1.3, 4)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=target,
+        map_b_qu=np.zeros_like(target),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        noise_cov_a=np.zeros((3, npix), dtype=np.float64),
+        noise_cov_b=np.zeros((3, npix), dtype=np.float64),
+        name="dust",
+        beam_window_a=template_beam,
+    )
+    calls: list[tuple[np.ndarray | None, np.ndarray | None]] = []
+
+    def fake_fit_foreground_templates(**kwargs):
+        calls.append(
+            (
+                None
+                if kwargs["target_beam_window"] is None
+                else np.asarray(kwargs["target_beam_window"]),
+                None
+                if kwargs["template_inputs"][0].beam_window_a is None
+                else np.asarray(kwargs["template_inputs"][0].beam_window_a),
+            )
+        )
+        processed_target = np.asarray(kwargs["target_qu"], dtype=np.float64)
+        processed_template = np.asarray(
+            kwargs["template_inputs"][0].map_a_qu,
+            dtype=np.float64,
+        )
+        return ftf.WeightedFitResult(
+            amplitudes=np.array([1.0], dtype=np.float64),
+            normal_matrix=np.ones((1, 1), dtype=np.float64),
+            normal_matrix_inverse=np.ones((1, 1), dtype=np.float64),
+            rhs=np.ones(1, dtype=np.float64),
+            residual_qu=np.zeros_like(processed_target),
+            processed_target_qu=processed_target,
+            processed_templates_qu=processed_template[None, :, :],
+            processed_templates_rhs_qu=processed_template[None, :, :],
+            processed_templates_data_qu=processed_template[None, :, :],
+            template_names=("dust",),
+            solver="solve",
+        )
+
+    monkeypatch.setattr(
+        noise_mod,
+        "fit_foreground_templates",
+        fake_fit_foreground_templates,
+    )
+
+    result = ftf.bootstrap_template_amplitudes(
+        target_qu=target,
+        target_noise_cov=target_noise_cov,
+        target_fwhm_in=10.0,
+        target_beam_window=target_beam,
+        template_inputs=(template_input,),
+        weight_map=np.ones(npix),
+        fwhm_out=0.0,
+        n_mc=3,
+        rng=1234,
+        n_jobs=2,
+    )
+
+    assert result.amplitude_samples.shape == (3, 1)
+    assert len(calls) == 4
+    for target_beam_seen, template_beam_seen in calls:
+        np.testing.assert_allclose(target_beam_seen, target_beam)
+        np.testing.assert_allclose(template_beam_seen, template_beam)
 
 
 def test_bootstrap_template_amplitudes_rejects_nonpositive_n_jobs() -> None:

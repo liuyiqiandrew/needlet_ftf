@@ -7,7 +7,11 @@ import numpy as np
 import numpy.typing as npt
 
 from ._arrays import as_qu_map, as_template_stack, as_weight_map, weighted_inner_product
-from ._filters import build_template_stack, smooth_and_filter_qu_map
+from ._filters import (
+    _apply_harmonic_preprocessing,
+    _build_template_stack_with_lmax,
+    _resolve_fit_harmonic_lmax,
+)
 from ._types import (
     DifferenceTemplateInput,
     FloatArray,
@@ -191,6 +195,7 @@ def fit_foreground_templates(
     weight_map: npt.ArrayLike,
     fwhm_out: float,
     *,
+    target_beam_window: npt.ArrayLike | None = None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None = None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None = None,
     target_filter: HarmonicFilter | None = None,
@@ -211,6 +216,11 @@ def fit_foreground_templates(
         Diagonal pixel weight map used in the fit.
     fwhm_out
         Common output beam FWHM in radians applied to target and templates.
+    target_beam_window
+        Optional real, finite, strictly positive 1D transfer ``B_ell`` for a
+        scalar-valued, axisymmetric target beam. It applies equally to E and B,
+        must cover the shared ``lmax``, and replaces the Gaussian beam implied
+        by ``target_fwhm_in``.
     template_inputs_rhs
         Optional sequence of right-hand template definitions. When supplied,
         the fit uses separate left- and right-hand template stacks in the
@@ -241,53 +251,30 @@ def fit_foreground_templates(
     Raises
     ------
     ValueError
-        If the left-, right-, or data-projection template lists have different
-        lengths.
+        If the template lists have incompatible lengths or any map, beam,
+        filter, or harmonic support is invalid.
+    ImportError
+        If harmonic preprocessing is required but Healpy is unavailable.
     """
 
-    processed_target = smooth_and_filter_qu_map(
-        target_qu,
-        fwhm_in=target_fwhm_in,
-        fwhm_out=fwhm_out,
-        filter_config=target_filter,
-        mask=mask,
-        nest=nest,
-    )
-    processed_templates, template_names = build_template_stack(
+    (
+        processed_target,
+        processed_templates,
+        processed_templates_rhs,
+        processed_templates_data,
+        template_names,
+    ) = _preprocess_fit_inputs(
+        target_qu=target_qu,
+        target_fwhm_in=target_fwhm_in,
+        target_beam_window=target_beam_window,
         template_inputs=template_inputs,
+        template_inputs_rhs=template_inputs_rhs,
+        template_inputs_data=template_inputs_data,
         fwhm_out=fwhm_out,
-        default_filter=target_filter,
+        target_filter=target_filter,
         mask=mask,
         nest=nest,
     )
-    if template_inputs_rhs is None:
-        processed_templates_rhs = processed_templates
-    else:
-        processed_templates_rhs, template_names_rhs = build_template_stack(
-            template_inputs=template_inputs_rhs,
-            fwhm_out=fwhm_out,
-            default_filter=target_filter,
-            mask=mask,
-            nest=nest,
-        )
-        if len(template_names_rhs) != len(template_names):
-            raise ValueError(
-                "template_inputs_rhs must contain the same number of templates as template_inputs."
-            )
-    if template_inputs_data is None:
-        processed_templates_data = None
-    else:
-        processed_templates_data, template_names_data = build_template_stack(
-            template_inputs=template_inputs_data,
-            fwhm_out=fwhm_out,
-            default_filter=target_filter,
-            mask=mask,
-            nest=nest,
-        )
-        if len(template_names_data) != len(template_names):
-            raise ValueError(
-                "template_inputs_data must contain the same number of templates as template_inputs."
-            )
     return weighted_template_gls(
         target_qu=processed_target,
         templates_qu=processed_templates,
@@ -306,6 +293,7 @@ def fit_foreground_templates_multi_mask(
     fwhm_out: float,
     *,
     master_mask: npt.ArrayLike,
+    target_beam_window: npt.ArrayLike | None = None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None = None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None = None,
     target_filter: HarmonicFilter | None = None,
@@ -340,6 +328,11 @@ def fit_foreground_templates_multi_mask(
     master_mask
         Binary or apodized mask applied to every input map before harmonic
         smoothing/filtering.
+    target_beam_window
+        Optional real, finite, strictly positive 1D transfer ``B_ell`` for a
+        scalar-valued, axisymmetric target beam. It applies equally to E and B,
+        must cover the shared ``lmax``, and replaces the Gaussian beam implied
+        by ``target_fwhm_in``.
     template_inputs_rhs
         Optional sequence of right-hand template definitions for the cross
         normal matrix.
@@ -370,8 +363,10 @@ def fit_foreground_templates_multi_mask(
     ------
     ValueError
         If ``weight_maps`` is empty, a mask or weight has an incompatible
-        shape, the support threshold is not finite, or the left-, right-, or
-        data-projection template lists have different lengths.
+        shape, the support threshold is not finite, template lists have
+        incompatible lengths, or harmonic preprocessing inputs are invalid.
+    ImportError
+        If harmonic preprocessing is required but Healpy is unavailable.
     """
 
     target = as_qu_map(target_qu, name="target_qu")
@@ -400,6 +395,7 @@ def fit_foreground_templates_multi_mask(
         fwhm_out=fwhm_out,
         master_mask_map=master_mask_map,
         master_support=master_support,
+        target_beam_window=target_beam_window,
         template_inputs_rhs=template_inputs_rhs,
         template_inputs_data=template_inputs_data,
         target_filter=target_filter,
@@ -509,6 +505,106 @@ def _build_master_support(
     return keep.astype(np.float64)
 
 
+def _preprocess_fit_inputs(
+    *,
+    target_qu: npt.ArrayLike,
+    target_fwhm_in: float,
+    template_inputs: Sequence[DifferenceTemplateInput],
+    fwhm_out: float,
+    target_beam_window: npt.ArrayLike | None,
+    template_inputs_rhs: Sequence[DifferenceTemplateInput] | None,
+    template_inputs_data: Sequence[DifferenceTemplateInput] | None,
+    target_filter: HarmonicFilter | None,
+    mask: npt.ArrayLike | None,
+    nest: bool,
+) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, tuple[str, ...]]:
+    """Preprocess every fit operand under one validated harmonic support.
+
+    Omitted RHS or data groups reuse the processed LHS stack. The return value
+    contains the target, LHS, RHS, and data arrays followed by template names.
+    """
+
+    lhs_inputs = tuple(template_inputs)
+    if not lhs_inputs:
+        raise ValueError("template_inputs must contain at least one template.")
+
+    rhs_inputs = None if template_inputs_rhs is None else tuple(template_inputs_rhs)
+    data_inputs = None if template_inputs_data is None else tuple(template_inputs_data)
+    for name, inputs in (
+        ("template_inputs_rhs", rhs_inputs),
+        ("template_inputs_data", data_inputs),
+    ):
+        if inputs is not None and len(inputs) != len(lhs_inputs):
+            raise ValueError(
+                f"{name} must contain the same number of templates as "
+                "template_inputs."
+            )
+
+    template_input_groups = tuple(
+        inputs for inputs in (lhs_inputs, rhs_inputs, data_inputs) if inputs is not None
+    )
+    harmonic_lmax = _resolve_fit_harmonic_lmax(
+        target_qu=target_qu,
+        target_fwhm_in=target_fwhm_in,
+        target_beam_window=target_beam_window,
+        template_input_groups=template_input_groups,
+        fwhm_out=fwhm_out,
+        target_filter=target_filter,
+    )
+
+    effective_target_filter = target_filter or HarmonicFilter()
+    processed_target = _apply_harmonic_preprocessing(
+        target_qu,
+        fwhm_in=target_fwhm_in,
+        fwhm_out=fwhm_out,
+        beam_window_in=target_beam_window,
+        filter_config=effective_target_filter,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
+    )
+    processed_lhs, template_names = _build_template_stack_with_lmax(
+        lhs_inputs,
+        fwhm_out=fwhm_out,
+        default_filter=target_filter,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
+    )
+
+    if rhs_inputs is None:
+        processed_rhs = processed_lhs
+    else:
+        processed_rhs, _ = _build_template_stack_with_lmax(
+            rhs_inputs,
+            fwhm_out=fwhm_out,
+            default_filter=target_filter,
+            mask=mask,
+            nest=nest,
+            harmonic_lmax=harmonic_lmax,
+        )
+
+    if data_inputs is None:
+        processed_data = processed_lhs
+    else:
+        processed_data, _ = _build_template_stack_with_lmax(
+            data_inputs,
+            fwhm_out=fwhm_out,
+            default_filter=target_filter,
+            mask=mask,
+            nest=nest,
+            harmonic_lmax=harmonic_lmax,
+        )
+
+    return (
+        processed_target,
+        processed_lhs,
+        processed_rhs,
+        processed_data,
+        template_names,
+    )
+
+
 def _preprocess_under_master_mask(
     *,
     target_qu: FloatArray,
@@ -517,6 +613,7 @@ def _preprocess_under_master_mask(
     fwhm_out: float,
     master_mask_map: FloatArray,
     master_support: FloatArray,
+    target_beam_window: npt.ArrayLike | None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None,
     target_filter: HarmonicFilter | None,
@@ -538,6 +635,9 @@ def _preprocess_under_master_mask(
         Harmonic preprocessing mask normalized to shape ``(2, npix)``.
     master_support
         Binary support map with shape ``(2, npix)`` applied after filtering.
+    target_beam_window
+        Optional input beam transfer function for ``target_qu``. When omitted,
+        the target input beam is treated as Gaussian with ``target_fwhm_in``.
     template_inputs_rhs
         Optional right-hand template definitions.
     template_inputs_data
@@ -556,49 +656,24 @@ def _preprocess_under_master_mask(
         ``(n_template, 2, npix)``.
     """
 
-    processed_target = smooth_and_filter_qu_map(
-        target_qu,
-        fwhm_in=target_fwhm_in,
-        fwhm_out=fwhm_out,
-        filter_config=target_filter,
-        mask=master_mask_map,
-        nest=nest,
-    )
-    processed_templates, template_names = build_template_stack(
+    (
+        processed_target,
+        processed_templates,
+        processed_templates_rhs,
+        processed_templates_data,
+        template_names,
+    ) = _preprocess_fit_inputs(
+        target_qu=target_qu,
+        target_fwhm_in=target_fwhm_in,
+        target_beam_window=target_beam_window,
         template_inputs=template_inputs,
+        template_inputs_rhs=template_inputs_rhs,
+        template_inputs_data=template_inputs_data,
         fwhm_out=fwhm_out,
-        default_filter=target_filter,
+        target_filter=target_filter,
         mask=master_mask_map,
         nest=nest,
     )
-    if template_inputs_rhs is None:
-        processed_templates_rhs = processed_templates
-    else:
-        processed_templates_rhs, template_names_rhs = build_template_stack(
-            template_inputs=template_inputs_rhs,
-            fwhm_out=fwhm_out,
-            default_filter=target_filter,
-            mask=master_mask_map,
-            nest=nest,
-        )
-        if len(template_names_rhs) != len(template_names):
-            raise ValueError(
-                "template_inputs_rhs must contain the same number of templates as template_inputs."
-            )
-    if template_inputs_data is None:
-        processed_templates_data = processed_templates
-    else:
-        processed_templates_data, template_names_data = build_template_stack(
-            template_inputs=template_inputs_data,
-            fwhm_out=fwhm_out,
-            default_filter=target_filter,
-            mask=master_mask_map,
-            nest=nest,
-        )
-        if len(template_names_data) != len(template_names):
-            raise ValueError(
-                "template_inputs_data must contain the same number of templates as template_inputs."
-            )
 
     # Apply support after the harmonic operation to zero pixels outside the
     # shared analysis region without multiplying by the apodization profile a

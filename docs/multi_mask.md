@@ -110,9 +110,16 @@ produces the value entering region `r`'s normal matrix is:
 1. **Pre-SHT** — every input map is multiplied by `master_mask(p)` in pixel
    space.
 2. **Harmonic round-trip** — `map2alm` → beam match × `ell`-filter `almxfl` →
-   `alm2map`, followed by the `m`-filter. The processed map carries the
-   imprint of `master_mask`'s apodization profile through the SHT, but no
-   further multiplication is applied in harmonic space.
+   `alm2map`, followed by the `m`-filter. Beam matching uses Gaussian
+   `fwhm_in` values by default, or a supplied custom input `B_ell` for maps that
+   define `target_beam_window` or `beam_window_a` / `beam_window_b`. The target
+   and every effective template map share the unique explicit
+   `HarmonicFilter.lmax`, or map-native `3 * nside - 1` when none is set.
+   Conflicting explicit values and beam or filter arrays shorter than
+   `lmax + 1` raise errors. If any operand needs harmonic work, all operands go
+   through the same SHT bandlimit. The processed map carries the imprint of
+   `master_mask`'s apodization profile through the SHT, but no further
+   multiplication is applied in harmonic space.
 3. **Post-SHT** — the processed map is multiplied by the **binary**
    `master_support(p)` (0 or 1). This zeroes pixels outside the analysis
    footprint without re-applying the apodization profile a second time.
@@ -333,10 +340,17 @@ It does **not** capture:
 
 ### Beam Matching and Filter Choice
 
-`fwhm_out` should be at least as large as the largest `fwhm_in` of any
-input map. Smoothing to a finer beam acts as deconvolution and amplifies
-high-`ell` noise. The `ell` high-pass and `m` cutoffs in `HarmonicFilter`
-are the standard place to suppress whatever modes are dominated by signal
-or noise components you do not want in the fit (large-scale CMB,
-scan-aligned 1/f, etc.) and should be chosen jointly with the apodization
-width above.
+For maps without custom beam windows, `fwhm_out` should be at least as large as
+the largest `fwhm_in`; smoothing to a finer beam acts as deconvolution and
+amplifies high-`ell` noise. For maps with custom input beam windows, the
+transfer is the Gaussian output beam divided by the supplied `B_ell`, so callers
+should choose `fwhm_out` and harmonic cutoffs with the same deconvolution risk in
+mind. A custom window is a real, finite, strictly positive, axisymmetric
+alm-amplitude `B_ell`, applied equally to E and B rather than supplied as
+`B_ell**2`. Separate E/B responses, asymmetric or `m`-dependent beams, and
+cross-polar response are not supported. `fwhm_out` and every Gaussian input
+FWHM must be finite and nonnegative, and the completed harmonic transfer must
+remain finite. The `ell` high-pass and `m` cutoffs in `HarmonicFilter` are the
+standard place to suppress whatever modes are dominated by signal or noise
+components you do not want in the fit (large-scale CMB, scan-aligned 1/f,
+etc.) and should be chosen jointly with the apodization width above.

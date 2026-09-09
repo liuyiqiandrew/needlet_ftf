@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from math import isqrt
 from typing import Sequence
 
 import numpy as np
@@ -12,6 +14,20 @@ try:
     import healpy as hp
 except ImportError:  # pragma: no cover - exercised only when healpy is unavailable.
     hp = None
+
+
+# Numerically identity beam ratios can stay on the transform-free NumPy path.
+_UNITY_TRANSFER_RTOL = 1.0e-12
+
+
+@dataclass(frozen=True)
+class _HarmonicInput:
+    """One map and its effective harmonic preprocessing configuration."""
+
+    qu_map: npt.ArrayLike
+    fwhm_in: float
+    beam_window_in: npt.ArrayLike | None
+    filter_config: HarmonicFilter
 
 
 def build_ell_filter(
@@ -100,6 +116,7 @@ def smooth_and_filter_qu_map(
     fwhm_in: float,
     fwhm_out: float,
     *,
+    beam_window_in: npt.ArrayLike | None = None,
     filter_config: HarmonicFilter | None = None,
     mask: npt.ArrayLike | None = None,
     nest: bool = False,
@@ -113,8 +130,15 @@ def smooth_and_filter_qu_map(
     fwhm_in
         Beam FWHM of the input map in radians.
     fwhm_out
-        Target beam FWHM in radians. The routine applies additional Gaussian
-        smoothing, so ``fwhm_out`` must be at least ``fwhm_in``.
+        Target Gaussian beam FWHM in radians. When ``beam_window_in`` is
+        omitted, the routine applies additional Gaussian smoothing, so
+        ``fwhm_out`` must be at least ``fwhm_in``.
+    beam_window_in
+        Optional scalar-valued, axisymmetric input beam transfer ``B_ell``. It
+        must be a real, finite, strictly positive 1D array covering the selected
+        ``lmax`` and is applied equally to E and B modes. When supplied, it
+        replaces the Gaussian input beam implied by ``fwhm_in``; ``fwhm_in`` is
+        then ignored.
     filter_config
         Optional harmonic filter configuration. Both the beam matching and the
         harmonic filters are applied in a single alm-domain pass.
@@ -131,87 +155,41 @@ def smooth_and_filter_qu_map(
     numpy.ndarray
         Smoothed and filtered Q/U map with shape ``(2, npix)``.
 
+    Raises
+    ------
+    ValueError
+        If map shapes, beam widths, harmonic support, or transfer windows are
+        invalid.
+    ImportError
+        If harmonic preprocessing is required but Healpy is unavailable.
+
     Notes
     -----
     All beam widths are expressed in radians.
     """
 
-    qu = as_qu_map(qu_map, name="qu_map")
-    filter_config = filter_config or HarmonicFilter()
-
-    if fwhm_out < fwhm_in and not np.isclose(fwhm_out, fwhm_in):
-        raise ValueError("fwhm_out must be greater than or equal to fwhm_in.")
-
-    if _is_identity_harmonic_operation(fwhm_in, fwhm_out, filter_config):
-        return qu.copy()
-
-    _require_healpy()
-
-    map_for_transform = qu
-    if mask is not None:
-        # Zero masked pixels before the harmonic transform so an apodized mask
-        # can suppress ringing from the finite lmax truncation.
-        map_for_transform = _apply_harmonic_preprocessing_mask(
-            qu=map_for_transform,
-            mask=mask,
-        )
-    if nest:
-        map_for_transform = np.asarray(
-            [hp.reorder(component, n2r=True) for component in map_for_transform],
-            dtype=np.float64,
-        )
-
-    npix = map_for_transform.shape[1]
-    nside = hp.npix2nside(npix)
-    lmax = _resolve_lmax(nside=nside, filter_config=filter_config)
-
-    # Healpy's polarized transform works on T/Q/U. We prepend a zero-temperature
-    # map, transform once, and only keep the polarization alms.
-    tqu = np.vstack([np.zeros(npix, dtype=np.float64), map_for_transform])
-    alm_t, alm_e, alm_b = hp.map2alm(
-        tqu,
-        lmax=lmax,
-        iter=filter_config.iter,
-        pol=True,
+    effective_filter = filter_config or HarmonicFilter()
+    harmonic_lmax = _resolve_harmonic_lmax(
+        (
+            _HarmonicInput(
+                qu_map=qu_map,
+                fwhm_in=fwhm_in,
+                beam_window_in=beam_window_in,
+                filter_config=effective_filter,
+            ),
+        ),
+        fwhm_out=fwhm_out,
     )
-    alm_t[...] = 0.0
-
-    ell_transfer = _build_ell_transfer(
-        lmax=lmax,
+    return _apply_harmonic_preprocessing(
+        qu_map,
         fwhm_in=fwhm_in,
         fwhm_out=fwhm_out,
-        filter_config=filter_config,
+        beam_window_in=beam_window_in,
+        filter_config=effective_filter,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
     )
-    alm_e = hp.almxfl(alm_e, ell_transfer, inplace=False)
-    alm_b = hp.almxfl(alm_b, ell_transfer, inplace=False)
-
-    if filter_config.m_filter is not None or filter_config.m_cutoff is not None:
-        _apply_m_filter_inplace(
-            alm=alm_e,
-            filter_config=filter_config,
-            lmax=lmax,
-        )
-        _apply_m_filter_inplace(
-            alm=alm_b,
-            filter_config=filter_config,
-            lmax=lmax,
-        )
-
-    filtered_tqu = hp.alm2map(
-        [alm_t, alm_e, alm_b],
-        nside=nside,
-        lmax=lmax,
-        pol=True,
-    )
-    filtered_qu = np.asarray(filtered_tqu[1:], dtype=np.float64)
-
-    if nest:
-        filtered_qu = np.asarray(
-            [hp.reorder(component, r2n=True) for component in filtered_qu],
-            dtype=np.float64,
-        )
-
-    return filtered_qu
 
 
 def construct_difference_template(
@@ -221,6 +199,8 @@ def construct_difference_template(
     fwhm_in_b: float,
     fwhm_out: float,
     *,
+    beam_window_a: npt.ArrayLike | None = None,
+    beam_window_b: npt.ArrayLike | None = None,
     filter_config: HarmonicFilter | None = None,
     mask: npt.ArrayLike | None = None,
     nest: bool = False,
@@ -239,6 +219,13 @@ def construct_difference_template(
         Beam FWHM of ``map_b_qu`` in radians.
     fwhm_out
         Common output beam FWHM in radians.
+    beam_window_a
+        Optional scalar-valued, axisymmetric input beam transfer ``B_ell`` for
+        ``map_a_qu``. It must be real, finite, strictly positive, and cover the
+        shared ``lmax``.
+    beam_window_b
+        Optional input beam transfer ``B_ell`` for ``map_b_qu`` with the same
+        requirements as ``beam_window_a``.
     filter_config
         Optional harmonic filter applied after beam matching.
     mask
@@ -253,25 +240,47 @@ def construct_difference_template(
     numpy.ndarray
         Difference template ``processed(map_a_qu) - processed(map_b_qu)`` with
         shape ``(2, npix)``.
+
+    Raises
+    ------
+    ValueError
+        If the maps cannot share one harmonic support or a beam/filter transfer
+        is invalid.
+    ImportError
+        If harmonic preprocessing is required but Healpy is unavailable.
     """
 
-    map_a_processed = smooth_and_filter_qu_map(
-        map_a_qu,
-        fwhm_in=fwhm_in_a,
+    effective_filter = filter_config or HarmonicFilter()
+    harmonic_lmax = _resolve_harmonic_lmax(
+        (
+            _HarmonicInput(
+                qu_map=map_a_qu,
+                fwhm_in=fwhm_in_a,
+                beam_window_in=beam_window_a,
+                filter_config=effective_filter,
+            ),
+            _HarmonicInput(
+                qu_map=map_b_qu,
+                fwhm_in=fwhm_in_b,
+                beam_window_in=beam_window_b,
+                filter_config=effective_filter,
+            ),
+        ),
         fwhm_out=fwhm_out,
-        filter_config=filter_config,
+    )
+    return _construct_difference_template_with_lmax(
+        map_a_qu=map_a_qu,
+        map_b_qu=map_b_qu,
+        fwhm_in_a=fwhm_in_a,
+        fwhm_in_b=fwhm_in_b,
+        fwhm_out=fwhm_out,
+        beam_window_a=beam_window_a,
+        beam_window_b=beam_window_b,
+        filter_config=effective_filter,
         mask=mask,
         nest=nest,
+        harmonic_lmax=harmonic_lmax,
     )
-    map_b_processed = smooth_and_filter_qu_map(
-        map_b_qu,
-        fwhm_in=fwhm_in_b,
-        fwhm_out=fwhm_out,
-        filter_config=filter_config,
-        mask=mask,
-        nest=nest,
-    )
-    return map_a_processed - map_b_processed
 
 
 def build_template_stack(
@@ -310,30 +319,198 @@ def build_template_stack(
     Raises
     ------
     ValueError
-        If ``template_inputs`` is empty.
+        If ``template_inputs`` is empty, its maps cannot share one harmonic
+        support, or a beam/filter transfer is invalid.
+    ImportError
+        If harmonic preprocessing is required but Healpy is unavailable.
     """
+
+    template_inputs = tuple(template_inputs)
+    if not template_inputs:
+        raise ValueError("template_inputs must contain at least one template.")
+
+    harmonic_lmax = _resolve_harmonic_lmax(
+        _template_harmonic_inputs(
+            template_inputs,
+            default_filter=default_filter,
+        ),
+        fwhm_out=fwhm_out,
+    )
+    return _build_template_stack_with_lmax(
+        template_inputs,
+        fwhm_out=fwhm_out,
+        default_filter=default_filter,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
+    )
+
+
+def _apply_harmonic_preprocessing(
+    qu_map: npt.ArrayLike,
+    fwhm_in: float,
+    fwhm_out: float,
+    *,
+    beam_window_in: npt.ArrayLike | None,
+    filter_config: HarmonicFilter,
+    mask: npt.ArrayLike | None,
+    nest: bool,
+    harmonic_lmax: int | None,
+) -> FloatArray:
+    """Apply a previously validated harmonic support to one Q/U map.
+
+    ``harmonic_lmax=None`` denotes an identity operation and returns a copy.
+    """
+
+    qu = as_qu_map(qu_map, name="qu_map")
+    if harmonic_lmax is None:
+        return qu.copy()
+
+    _require_healpy()
+    map_for_transform = qu
+    if mask is not None:
+        # Zero masked pixels before the harmonic transform so an apodized mask
+        # can suppress ringing from the finite lmax truncation.
+        map_for_transform = _apply_harmonic_preprocessing_mask(
+            qu=map_for_transform,
+            mask=mask,
+        )
+    if nest:
+        map_for_transform = np.asarray(
+            [hp.reorder(component, n2r=True) for component in map_for_transform],
+            dtype=np.float64,
+        )
+
+    npix = map_for_transform.shape[1]
+    nside = hp.npix2nside(npix)
+    ell_transfer = _build_ell_transfer(
+        lmax=harmonic_lmax,
+        fwhm_in=fwhm_in,
+        fwhm_out=fwhm_out,
+        filter_config=filter_config,
+        beam_window_in=beam_window_in,
+    )
+
+    # Healpy's polarized transform works on T/Q/U. Prepending a zero
+    # temperature map lets one transform produce both polarization alms.
+    tqu = np.vstack([np.zeros(npix, dtype=np.float64), map_for_transform])
+    alm_t, alm_e, alm_b = hp.map2alm(
+        tqu,
+        lmax=harmonic_lmax,
+        iter=filter_config.iter,
+        pol=True,
+    )
+    alm_t[...] = 0.0
+    alm_e = hp.almxfl(alm_e, ell_transfer, inplace=False)
+    alm_b = hp.almxfl(alm_b, ell_transfer, inplace=False)
+
+    if filter_config.m_filter is not None or filter_config.m_cutoff is not None:
+        m_transfer = _build_m_transfer(
+            filter_config=filter_config,
+            lmax=harmonic_lmax,
+        )
+        _, m_indices = hp.Alm.getlm(harmonic_lmax)
+        packed_m_transfer = m_transfer[m_indices]
+        alm_e *= packed_m_transfer
+        alm_b *= packed_m_transfer
+
+    filtered_tqu = hp.alm2map(
+        [alm_t, alm_e, alm_b],
+        nside=nside,
+        lmax=harmonic_lmax,
+        pol=True,
+    )
+    filtered_qu = np.asarray(filtered_tqu[1:], dtype=np.float64)
+
+    if nest:
+        filtered_qu = np.asarray(
+            [hp.reorder(component, r2n=True) for component in filtered_qu],
+            dtype=np.float64,
+        )
+    return filtered_qu
+
+
+def _construct_difference_template_with_lmax(
+    map_a_qu: npt.ArrayLike,
+    map_b_qu: npt.ArrayLike,
+    fwhm_in_a: float,
+    fwhm_in_b: float,
+    fwhm_out: float,
+    *,
+    beam_window_a: npt.ArrayLike | None,
+    beam_window_b: npt.ArrayLike | None,
+    filter_config: HarmonicFilter,
+    mask: npt.ArrayLike | None,
+    nest: bool,
+    harmonic_lmax: int | None,
+) -> FloatArray:
+    """Build one difference template using a validated shared support.
+
+    ``harmonic_lmax=None`` keeps both operands on the identity copy path.
+    """
+
+    map_a_processed = _apply_harmonic_preprocessing(
+        map_a_qu,
+        fwhm_in=fwhm_in_a,
+        fwhm_out=fwhm_out,
+        beam_window_in=beam_window_a,
+        filter_config=filter_config,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
+    )
+    map_b_processed = _apply_harmonic_preprocessing(
+        map_b_qu,
+        fwhm_in=fwhm_in_b,
+        fwhm_out=fwhm_out,
+        beam_window_in=beam_window_b,
+        filter_config=filter_config,
+        mask=mask,
+        nest=nest,
+        harmonic_lmax=harmonic_lmax,
+    )
+    return map_a_processed - map_b_processed
+
+
+def _build_template_stack_with_lmax(
+    template_inputs: Sequence[DifferenceTemplateInput],
+    *,
+    fwhm_out: float,
+    default_filter: HarmonicFilter | None,
+    mask: npt.ArrayLike | None,
+    nest: bool,
+    harmonic_lmax: int | None,
+) -> tuple[FloatArray, tuple[str, ...]]:
+    """Build a template stack using a validated shared support.
+
+    ``harmonic_lmax=None`` keeps every operand on the identity copy path.
+    """
+
+    if not template_inputs:
+        raise ValueError("template_inputs must contain at least one template.")
 
     template_maps: list[FloatArray] = []
     template_names: list[str] = []
-
     for index, template_input in enumerate(template_inputs):
-        template_filter = template_input.filter_config or default_filter
+        effective_filter = (
+            template_input.filter_config or default_filter or HarmonicFilter()
+        )
         template_maps.append(
-            construct_difference_template(
+            _construct_difference_template_with_lmax(
                 map_a_qu=template_input.map_a_qu,
                 map_b_qu=template_input.map_b_qu,
                 fwhm_in_a=template_input.fwhm_in_a,
                 fwhm_in_b=template_input.fwhm_in_b,
                 fwhm_out=fwhm_out,
-                filter_config=template_filter,
+                beam_window_a=template_input.beam_window_a,
+                beam_window_b=template_input.beam_window_b,
+                filter_config=effective_filter,
                 mask=mask,
                 nest=nest,
+                harmonic_lmax=harmonic_lmax,
             )
         )
         template_names.append(template_input.name or f"template_{index}")
-
-    if not template_maps:
-        raise ValueError("template_inputs must contain at least one template.")
 
     return np.stack(template_maps, axis=0), tuple(template_names)
 
@@ -351,41 +528,196 @@ def _apply_harmonic_preprocessing_mask(
     return safe_qu * safe_mask
 
 
-def _is_identity_harmonic_operation(
-    fwhm_in: float,
+def _resolve_harmonic_lmax(
+    harmonic_inputs: Sequence[_HarmonicInput],
+    *,
     fwhm_out: float,
-    filter_config: HarmonicFilter,
-) -> bool:
-    """Check whether smoothing/filtering would leave the map unchanged.
+) -> int | None:
+    """Validate a map collection and return its shared transform support.
 
-    Parameters
-    ----------
-    fwhm_in
-        Input beam FWHM in radians.
-    fwhm_out
-        Requested output beam FWHM in radians.
-    filter_config
-        Harmonic filter configuration.
-
-    Returns
-    -------
-    bool
-        ``True`` when no beam change, no explicit filters, and no cutoff-based
-        filters are requested.
+    Every map must have the same pixel count and use one explicit ``lmax`` or
+    the map-native support. All transfer windows are validated before any SHT.
+    ``None`` denotes a validated identity operation that can stay in NumPy.
     """
 
-    no_beam_change = np.isclose(fwhm_in, fwhm_out)
-    no_ell_filter = filter_config.ell_filter is None
-    no_m_filter = filter_config.m_filter is None
-    no_ell_cutoff = filter_config.ell_cutoff is None
-    no_m_cutoff = filter_config.m_cutoff is None
-    return (
-        no_beam_change
-        and no_ell_filter
-        and no_m_filter
-        and no_ell_cutoff
-        and no_m_cutoff
+    if not harmonic_inputs:
+        raise ValueError("harmonic_inputs must contain at least one map.")
+
+    output_fwhm = _validate_fwhm(fwhm_out, name="fwhm_out")
+    npix_values = {
+        as_qu_map(item.qu_map, name="qu_map").shape[1] for item in harmonic_inputs
+    }
+    if len(npix_values) != 1:
+        raise ValueError("All harmonically processed maps must have the same npix.")
+
+    needs_transfer_evaluation = False
+    for item in harmonic_inputs:
+        if item.beam_window_in is None:
+            input_fwhm = _validate_fwhm(item.fwhm_in, name="fwhm_in")
+            if output_fwhm < input_fwhm and not np.isclose(
+                output_fwhm,
+                input_fwhm,
+            ):
+                raise ValueError("fwhm_out must be greater than or equal to fwhm_in.")
+            needs_transfer_evaluation = needs_transfer_evaluation or not np.isclose(
+                input_fwhm,
+                output_fwhm,
+            )
+        else:
+            # A custom beam fully replaces fwhm_in, including its validation.
+            needs_transfer_evaluation = True
+        needs_transfer_evaluation = (
+            needs_transfer_evaluation or _filter_requests_harmonic(item.filter_config)
+        )
+
+    if not needs_transfer_evaluation:
+        return None
+
+    npix = next(iter(npix_values))
+    nside = _nside_from_npix(npix)
+
+    explicit_lmax_values = {
+        int(item.filter_config.lmax)
+        for item in harmonic_inputs
+        if item.filter_config.lmax is not None
+    }
+    if len(explicit_lmax_values) > 1:
+        raise ValueError(
+            "All harmonic filter configurations must use the same explicit lmax."
+        )
+    explicit_lmax = next(iter(explicit_lmax_values)) if explicit_lmax_values else None
+    common_lmax = _resolve_lmax(nside=nside, explicit_lmax=explicit_lmax)
+
+    requires_transform = False
+    for item in harmonic_inputs:
+        ell_transfer = _build_ell_transfer(
+            lmax=common_lmax,
+            fwhm_in=item.fwhm_in,
+            fwhm_out=output_fwhm,
+            filter_config=item.filter_config,
+            beam_window_in=item.beam_window_in,
+        )
+        if (
+            item.filter_config.m_filter is not None
+            or item.filter_config.m_cutoff is not None
+        ):
+            _build_m_transfer(
+                filter_config=item.filter_config,
+                lmax=common_lmax,
+            )
+        requires_transform = (
+            requires_transform
+            or _filter_requests_harmonic(item.filter_config)
+            or not np.allclose(
+                ell_transfer,
+                1.0,
+                rtol=_UNITY_TRANSFER_RTOL,
+                atol=0.0,
+            )
+        )
+
+    return common_lmax if requires_transform else None
+
+
+def _filter_requests_harmonic(filter_config: HarmonicFilter) -> bool:
+    """Return whether a filter configuration explicitly requests harmonic work."""
+
+    return any(
+        value is not None
+        for value in (
+            filter_config.ell_filter,
+            filter_config.m_filter,
+            filter_config.ell_cutoff,
+            filter_config.m_cutoff,
+            filter_config.lmax,
+        )
     )
+
+
+def _template_harmonic_inputs(
+    template_inputs: Sequence[DifferenceTemplateInput],
+    *,
+    default_filter: HarmonicFilter | None,
+) -> tuple[_HarmonicInput, ...]:
+    """Expand template definitions into their per-map harmonic inputs."""
+
+    harmonic_inputs: list[_HarmonicInput] = []
+    for template_input in template_inputs:
+        effective_filter = (
+            template_input.filter_config or default_filter or HarmonicFilter()
+        )
+        harmonic_inputs.extend(
+            (
+                _HarmonicInput(
+                    qu_map=template_input.map_a_qu,
+                    fwhm_in=template_input.fwhm_in_a,
+                    beam_window_in=template_input.beam_window_a,
+                    filter_config=effective_filter,
+                ),
+                _HarmonicInput(
+                    qu_map=template_input.map_b_qu,
+                    fwhm_in=template_input.fwhm_in_b,
+                    beam_window_in=template_input.beam_window_b,
+                    filter_config=effective_filter,
+                ),
+            )
+        )
+    return tuple(harmonic_inputs)
+
+
+def _resolve_fit_harmonic_lmax(
+    *,
+    target_qu: npt.ArrayLike,
+    target_fwhm_in: float,
+    target_beam_window: npt.ArrayLike | None,
+    template_input_groups: Sequence[Sequence[DifferenceTemplateInput]],
+    fwhm_out: float,
+    target_filter: HarmonicFilter | None,
+) -> int | None:
+    """Resolve one shared harmonic support for every operand in a fit."""
+
+    effective_target_filter = target_filter or HarmonicFilter()
+    harmonic_inputs: list[_HarmonicInput] = [
+        _HarmonicInput(
+            qu_map=target_qu,
+            fwhm_in=target_fwhm_in,
+            beam_window_in=target_beam_window,
+            filter_config=effective_target_filter,
+        )
+    ]
+    for group in template_input_groups:
+        harmonic_inputs.extend(
+            _template_harmonic_inputs(
+                group,
+                default_filter=target_filter,
+            )
+        )
+
+    return _resolve_harmonic_lmax(
+        harmonic_inputs,
+        fwhm_out=fwhm_out,
+    )
+
+
+def _validate_fwhm(fwhm: float, *, name: str) -> float:
+    """Validate and return a finite, nonnegative beam FWHM."""
+
+    try:
+        value = float(fwhm)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite, nonnegative number.") from error
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and nonnegative.")
+    return value
+
+
+def _nside_from_npix(npix: int) -> int:
+    """Infer Healpix nside without importing Healpy on identity-only paths."""
+
+    nside = isqrt(npix // 12)
+    if nside == 0 or 12 * nside**2 != npix:
+        raise ValueError(f"npix={npix} is not a valid Healpix pixel count.")
+    return nside
 
 
 def _require_healpy() -> None:
@@ -404,15 +736,18 @@ def _require_healpy() -> None:
         )
 
 
-def _resolve_lmax(nside: int, filter_config: HarmonicFilter) -> int:
-    """Resolve the harmonic truncation consistent with map and filter support.
+def _resolve_lmax(
+    nside: int,
+    explicit_lmax: int | None,
+) -> int:
+    """Resolve a map-native or explicit harmonic truncation.
 
     Parameters
     ----------
     nside
         Healpix ``nside`` of the working map.
-    filter_config
-        Harmonic filter configuration.
+    explicit_lmax
+        Caller-selected maximum multipole, or ``None`` for map-native support.
 
     Returns
     -------
@@ -422,35 +757,15 @@ def _resolve_lmax(nside: int, filter_config: HarmonicFilter) -> int:
     Raises
     ------
     ValueError
-        If the requested ``lmax`` exceeds the supported range or resolves to a
-        value smaller than 2.
+        If ``explicit_lmax`` exceeds the map-native support or resolves below 2.
     """
 
     native_lmax = 3 * nside - 1
-    max_supported = native_lmax
-
-    if filter_config.ell_filter is not None:
-        max_supported = min(
-            max_supported,
-            len(np.asarray(filter_config.ell_filter)) - 1,
-        )
-    if filter_config.m_filter is not None:
-        max_supported = min(
-            max_supported,
-            len(np.asarray(filter_config.m_filter)) - 1,
-        )
-    if filter_config.lmax is None:
-        lmax = max_supported
-    else:
-        lmax = int(filter_config.lmax)
-        if lmax > max_supported:
-            raise ValueError(
-                "filter_config.lmax exceeds the supported range of the map or "
-                "supplied filters."
-            )
-
+    lmax = native_lmax if explicit_lmax is None else int(explicit_lmax)
     if lmax < 2:
         raise ValueError("Resolved lmax must be at least 2.")
+    if lmax > native_lmax:
+        raise ValueError("Explicit lmax exceeds the map-native harmonic support.")
     return lmax
 
 
@@ -460,6 +775,7 @@ def _build_ell_transfer(
     fwhm_in: float,
     fwhm_out: float,
     filter_config: HarmonicFilter,
+    beam_window_in: npt.ArrayLike | None = None,
 ) -> FloatArray:
     """Assemble the full multipole transfer function for beam/filter matching.
 
@@ -473,6 +789,9 @@ def _build_ell_transfer(
         Output beam FWHM in radians.
     filter_config
         Harmonic filter configuration.
+    beam_window_in
+        Optional custom input beam transfer function. When supplied, the beam
+        transfer is the Gaussian output beam divided by this window.
 
     Returns
     -------
@@ -481,68 +800,130 @@ def _build_ell_transfer(
         ``lmax + 1``.
     """
 
+    output_fwhm = _validate_fwhm(fwhm_out, name="fwhm_out")
     ells = np.arange(lmax + 1, dtype=np.float64)
-    sigma_in = _fwhm_to_sigma(fwhm_in)
-    sigma_out = _fwhm_to_sigma(fwhm_out)
-    sigma_extra_sq = np.maximum(sigma_out**2 - sigma_in**2, 0.0)
-    transfer = np.exp(-0.5 * ells * (ells + 1.0) * sigma_extra_sq)
+    ell_factor = ells * (ells + 1.0)
+    sigma_out = _fwhm_to_sigma(output_fwhm)
+    if beam_window_in is None:
+        input_fwhm = _validate_fwhm(fwhm_in, name="fwhm_in")
+        if output_fwhm < input_fwhm and not np.isclose(
+            output_fwhm,
+            input_fwhm,
+        ):
+            raise ValueError("fwhm_out must be greater than or equal to fwhm_in.")
+        sigma_in = _fwhm_to_sigma(input_fwhm)
+        # ``isclose`` permits tiny roundoff-level inversions in the requested
+        # widths, so clip the additional smoothing variance at zero.
+        sigma_extra_sq = np.maximum(sigma_out**2 - sigma_in**2, 0.0)
+        transfer_numerator = np.exp(-0.5 * ell_factor * sigma_extra_sq)
+    else:
+        transfer_numerator = np.exp(-0.5 * ell_factor * sigma_out**2)
 
     if filter_config.ell_filter is not None:
-        ell_filter_array = np.asarray(filter_config.ell_filter, dtype=np.float64)
-        if ell_filter_array.shape[0] < lmax + 1:
-            raise ValueError(
-                "ell_filter must have length at least lmax + 1 when lmax is explicit."
-            )
-        transfer *= ell_filter_array[: lmax + 1]
+        ell_filter_window = _as_transfer_window(
+            filter_config.ell_filter,
+            lmax=lmax,
+            name="ell_filter",
+        )
+        transfer_numerator *= ell_filter_window
 
     if filter_config.ell_cutoff is not None:
-        transfer *= _build_apodized_highpass(
+        transfer_numerator *= _build_apodized_highpass(
             num_modes=lmax + 1,
             cutoff=filter_config.ell_cutoff,
             halfwidth=filter_config.ell_halfwidth,
             transition_type=filter_config.transition_type,
         )
 
+    if beam_window_in is None:
+        transfer = transfer_numerator
+    else:
+        input_beam = _as_beam_window(
+            beam_window_in,
+            lmax=lmax,
+            name="beam_window_in",
+        )
+        # Apply filter zeros before deconvolution. Suppressed modes then remain
+        # exactly zero even when the corresponding input beam is extremely small.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            transfer = transfer_numerator / input_beam
+
+    if not np.isfinite(transfer).all():
+        raise ValueError(
+            "The assembled ell transfer is non-finite; reduce lmax or "
+            "deconvolution gain."
+        )
     return transfer
 
 
-def _apply_m_filter_inplace(
+def _as_transfer_window(
+    transfer: npt.ArrayLike,
     *,
-    alm: npt.NDArray[np.complex128],
+    lmax: int,
+    name: str,
+    kind: str = "transfer function",
+) -> FloatArray:
+    """Validate and return a real transfer window through ``lmax``."""
+
+    raw_array = np.asarray(transfer)
+    if np.iscomplexobj(raw_array):
+        raise ValueError(f"{name} must be a real-valued {kind}.")
+    array = np.asarray(raw_array, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be a 1D {kind}.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must be finite.")
+    if array.shape[0] < lmax + 1:
+        raise ValueError(f"{name} must have length at least lmax + 1.")
+    return array[: lmax + 1]
+
+
+def _as_beam_window(
+    beam_window: npt.ArrayLike,
+    *,
+    lmax: int,
+    name: str,
+) -> FloatArray:
+    """Validate a custom input beam window through ``lmax``."""
+
+    window = _as_transfer_window(
+        beam_window,
+        lmax=lmax,
+        name=name,
+        kind="beam transfer function",
+    )
+    if np.any(window <= 0.0):
+        raise ValueError(f"{name} must be strictly positive through lmax.")
+    return window
+
+
+def _build_m_transfer(
+    *,
     filter_config: HarmonicFilter,
     lmax: int,
-) -> None:
-    """Apply the configured explicit and cutoff-based ``m`` filters in place.
+) -> FloatArray:
+    """Build and validate the configured azimuthal transfer function."""
 
-    Parameters
-    ----------
-    alm
-        Harmonic coefficients modified in place.
-    filter_config
-        Harmonic filter configuration.
-    lmax
-        Maximum multipole of ``alm``.
-    """
-
-    m_transfer = np.ones(lmax + 1, dtype=np.float64)
-
+    transfer = np.ones(lmax + 1, dtype=np.float64)
     if filter_config.m_filter is not None:
-        m_filter_array = np.asarray(filter_config.m_filter, dtype=np.float64)
-        if m_filter_array.shape[0] < lmax + 1:
-            raise ValueError("m_filter must have length at least lmax + 1.")
-        m_transfer *= m_filter_array[: lmax + 1]
+        m_filter_window = _as_transfer_window(
+            filter_config.m_filter,
+            lmax=lmax,
+            name="m_filter",
+        )
+        transfer *= m_filter_window
 
     if filter_config.m_cutoff is not None:
-        m_transfer *= _build_apodized_highpass(
+        transfer *= _build_apodized_highpass(
             num_modes=lmax + 1,
             cutoff=filter_config.m_cutoff,
             halfwidth=filter_config.m_halfwidth,
             transition_type=filter_config.transition_type,
         )
 
-    ell, emm = hp.Alm.getlm(lmax)
-    del ell
-    alm *= m_transfer[emm]
+    if not np.isfinite(transfer).all():
+        raise ValueError("The assembled m transfer must be finite.")
+    return transfer
 
 
 def _build_apodized_highpass(

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import fg_weighted_template_fit as ftf
+import fg_weighted_template_fit._filters as filters_mod
 import fg_weighted_template_fit._fit as fit_mod
 
 
@@ -129,30 +130,33 @@ def test_fit_foreground_templates_passes_mask_to_preprocessing_helpers(
     template_masks: list[np.ndarray | None] = []
     gls_masks: list[np.ndarray | None] = []
 
-    def fake_smooth_and_filter_qu_map(
+    def fake_apply_harmonic_preprocessing(
         qu_map,
         fwhm_in,
         fwhm_out,
         *,
-        filter_config=None,
-        mask=None,
-        nest=False,
+        beam_window_in,
+        filter_config,
+        mask,
+        nest,
+        harmonic_lmax,
     ):
-        del fwhm_in, fwhm_out, filter_config, nest
+        del fwhm_in, fwhm_out, beam_window_in, filter_config, nest, harmonic_lmax
         target_masks.append(
             None if mask is None else np.asarray(mask, dtype=np.float64)
         )
         return np.asarray(qu_map, dtype=np.float64)
 
-    def fake_build_template_stack(
-        *,
+    def fake_build_template_stack_with_lmax(
         template_inputs,
+        *,
         fwhm_out,
-        default_filter=None,
-        mask=None,
-        nest=False,
+        default_filter,
+        mask,
+        nest,
+        harmonic_lmax,
     ):
-        del fwhm_out, default_filter, nest
+        del fwhm_out, default_filter, nest, harmonic_lmax
         template_masks.append(
             None if mask is None else np.asarray(mask, dtype=np.float64)
         )
@@ -194,9 +198,13 @@ def test_fit_foreground_templates_passes_mask_to_preprocessing_helpers(
         )
 
     monkeypatch.setattr(
-        fit_mod, "smooth_and_filter_qu_map", fake_smooth_and_filter_qu_map
+        fit_mod, "_apply_harmonic_preprocessing", fake_apply_harmonic_preprocessing
     )
-    monkeypatch.setattr(fit_mod, "build_template_stack", fake_build_template_stack)
+    monkeypatch.setattr(
+        fit_mod,
+        "_build_template_stack_with_lmax",
+        fake_build_template_stack_with_lmax,
+    )
     monkeypatch.setattr(fit_mod, "weighted_template_gls", fake_weighted_template_gls)
 
     result = ftf.fit_foreground_templates(
@@ -216,6 +224,202 @@ def test_fit_foreground_templates_passes_mask_to_preprocessing_helpers(
     np.testing.assert_allclose(template_masks[0], mask)
     np.testing.assert_allclose(template_masks[1], mask)
     assert gls_masks == [None]
+
+
+def test_fit_foreground_templates_threads_target_beam_window(monkeypatch) -> None:
+    """Pass a custom target beam window into target preprocessing."""
+
+    target = np.tile(
+        np.array(
+            [
+                [1.0, 0.5, -0.2, 0.3],
+                [0.2, -0.3, 0.6, 1.2],
+            ],
+            dtype=np.float64,
+        ),
+        (1, 3),
+    )
+    beam_window = np.linspace(1.0, 1.3, 5)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=target,
+        map_b_qu=np.zeros_like(target),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        name="dust",
+    )
+    target_beams: list[np.ndarray | None] = []
+
+    def fake_apply_harmonic_preprocessing(
+        qu_map,
+        fwhm_in,
+        fwhm_out,
+        *,
+        beam_window_in,
+        filter_config,
+        mask,
+        nest,
+        harmonic_lmax,
+    ):
+        del fwhm_in, fwhm_out, filter_config, mask, nest, harmonic_lmax
+        target_beams.append(
+            None if beam_window_in is None else np.asarray(beam_window_in)
+        )
+        return np.asarray(qu_map, dtype=np.float64)
+
+    def fake_build_template_stack_with_lmax(
+        template_inputs,
+        *,
+        fwhm_out,
+        default_filter,
+        mask,
+        nest,
+        harmonic_lmax,
+    ):
+        del fwhm_out, default_filter, mask, nest, harmonic_lmax
+        templates = np.stack(
+            [
+                np.asarray(template_input.map_a_qu, dtype=np.float64)
+                - np.asarray(template_input.map_b_qu, dtype=np.float64)
+                for template_input in template_inputs
+            ],
+            axis=0,
+        )
+        return templates, tuple(
+            template_input.name for template_input in template_inputs
+        )
+
+    monkeypatch.setattr(
+        fit_mod, "_apply_harmonic_preprocessing", fake_apply_harmonic_preprocessing
+    )
+    monkeypatch.setattr(
+        fit_mod,
+        "_build_template_stack_with_lmax",
+        fake_build_template_stack_with_lmax,
+    )
+
+    result = ftf.fit_foreground_templates(
+        target_qu=target,
+        target_fwhm_in=10.0,
+        template_inputs=(template_input,),
+        weight_map=np.ones(target.shape[1]),
+        fwhm_out=0.0,
+        target_beam_window=beam_window,
+    )
+
+    np.testing.assert_allclose(result.amplitudes, [1.0], atol=1e-12)
+    assert len(target_beams) == 1
+    np.testing.assert_allclose(target_beams[0], beam_window)
+
+
+@pytest.mark.skipif(filters_mod.hp is None, reason="healpy not installed")
+def test_fit_foreground_templates_recovers_amplitude_with_custom_beams() -> None:
+    """Recover an exact amplitude through real custom-beam preprocessing."""
+
+    nside = 4
+    npix = 12 * nside**2
+    lmax = 5
+    amplitude = 1.7
+    rng = np.random.default_rng(283)
+    template_map = rng.standard_normal((2, npix))
+    beam_window = np.linspace(1.0, 0.8, lmax + 1)
+    filter_config = ftf.HarmonicFilter(lmax=lmax, iter=5)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=template_map,
+        map_b_qu=np.zeros_like(template_map),
+        fwhm_in_a=np.nan,
+        fwhm_in_b=0.0,
+        filter_config=filter_config,
+        name="dust",
+        beam_window_a=beam_window,
+    )
+
+    result = ftf.fit_foreground_templates(
+        target_qu=amplitude * template_map,
+        target_fwhm_in=np.nan,
+        target_beam_window=beam_window,
+        template_inputs=(template_input,),
+        weight_map=np.ones(npix),
+        fwhm_out=0.0,
+        target_filter=filter_config,
+    )
+
+    np.testing.assert_allclose(result.amplitudes, [amplitude], atol=1.0e-10)
+    np.testing.assert_allclose(result.residual_qu, 0.0, atol=1.0e-10)
+
+
+@pytest.mark.parametrize(
+    "optional_group_name",
+    ["template_inputs_rhs", "template_inputs_data"],
+)
+def test_preprocess_fit_inputs_shares_optional_group_lmax(
+    monkeypatch,
+    optional_group_name: str,
+) -> None:
+    """Propagate an optional group's explicit lmax to every fit operand."""
+
+    qu_map = np.ones((2, 12), dtype=np.float64)
+    lhs_input = ftf.DifferenceTemplateInput(
+        map_a_qu=qu_map,
+        map_b_qu=np.zeros_like(qu_map),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        name="lhs",
+    )
+    harmonic_input = ftf.DifferenceTemplateInput(
+        map_a_qu=qu_map,
+        map_b_qu=np.zeros_like(qu_map),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        filter_config=ftf.HarmonicFilter(lmax=2),
+        name="optional",
+    )
+
+    seen_lmax: list[int | None] = []
+
+    def fake_apply_harmonic_preprocessing(
+        qu_map,
+        fwhm_in,
+        fwhm_out,
+        *,
+        harmonic_lmax,
+        **kwargs,
+    ):
+        del fwhm_in, fwhm_out, kwargs
+        seen_lmax.append(harmonic_lmax)
+        return np.asarray(qu_map, dtype=np.float64)
+
+    monkeypatch.setattr(
+        fit_mod,
+        "_apply_harmonic_preprocessing",
+        fake_apply_harmonic_preprocessing,
+    )
+    monkeypatch.setattr(
+        filters_mod,
+        "_apply_harmonic_preprocessing",
+        fake_apply_harmonic_preprocessing,
+    )
+
+    optional_groups: dict[
+        str,
+        tuple[ftf.DifferenceTemplateInput, ...] | None,
+    ] = {
+        "template_inputs_rhs": None,
+        "template_inputs_data": None,
+    }
+    optional_groups[optional_group_name] = (harmonic_input,)
+    fit_mod._preprocess_fit_inputs(
+        target_qu=qu_map,
+        target_fwhm_in=0.0,
+        template_inputs=(lhs_input,),
+        fwhm_out=0.0,
+        target_beam_window=None,
+        target_filter=None,
+        mask=None,
+        nest=False,
+        **optional_groups,
+    )
+
+    assert seen_lmax == [2] * 5
 
 
 def test_fit_foreground_templates_multi_mask_applies_binary_master_support() -> None:
@@ -256,6 +460,14 @@ def test_fit_foreground_templates_multi_mask_applies_binary_master_support() -> 
     np.testing.assert_allclose(result.processed_target_qu, target * support_qu)
     np.testing.assert_allclose(
         result.processed_templates_qu[0],
+        template * support_qu,
+    )
+    np.testing.assert_allclose(
+        result.processed_templates_rhs_qu[0],
+        template * support_qu,
+    )
+    np.testing.assert_allclose(
+        result.processed_templates_data_qu[0],
         template * support_qu,
     )
     np.testing.assert_allclose(result.fit_results["m1"].amplitudes, [2.5])
@@ -421,30 +633,33 @@ def test_fit_foreground_templates_multi_mask_uses_master_mask_for_preprocessing(
     gls_masks: list[np.ndarray | None] = []
     gls_weights: list[np.ndarray] = []
 
-    def fake_smooth_and_filter_qu_map(
+    def fake_apply_harmonic_preprocessing(
         qu_map,
         fwhm_in,
         fwhm_out,
         *,
-        filter_config=None,
-        mask=None,
-        nest=False,
+        beam_window_in,
+        filter_config,
+        mask,
+        nest,
+        harmonic_lmax,
     ):
-        del fwhm_in, fwhm_out, filter_config, nest
+        del fwhm_in, fwhm_out, beam_window_in, filter_config, nest, harmonic_lmax
         target_masks.append(
             None if mask is None else np.asarray(mask, dtype=np.float64)
         )
         return np.asarray(qu_map, dtype=np.float64)
 
-    def fake_build_template_stack(
-        *,
+    def fake_build_template_stack_with_lmax(
         template_inputs,
+        *,
         fwhm_out,
-        default_filter=None,
-        mask=None,
-        nest=False,
+        default_filter,
+        mask,
+        nest,
+        harmonic_lmax,
     ):
-        del fwhm_out, default_filter, nest
+        del fwhm_out, default_filter, nest, harmonic_lmax
         template_masks.append(
             None if mask is None else np.asarray(mask, dtype=np.float64)
         )
@@ -487,9 +702,13 @@ def test_fit_foreground_templates_multi_mask_uses_master_mask_for_preprocessing(
         )
 
     monkeypatch.setattr(
-        fit_mod, "smooth_and_filter_qu_map", fake_smooth_and_filter_qu_map
+        fit_mod, "_apply_harmonic_preprocessing", fake_apply_harmonic_preprocessing
     )
-    monkeypatch.setattr(fit_mod, "build_template_stack", fake_build_template_stack)
+    monkeypatch.setattr(
+        fit_mod,
+        "_build_template_stack_with_lmax",
+        fake_build_template_stack_with_lmax,
+    )
     monkeypatch.setattr(fit_mod, "weighted_template_gls", fake_weighted_template_gls)
 
     result = ftf.fit_foreground_templates_multi_mask(
@@ -512,6 +731,94 @@ def test_fit_foreground_templates_multi_mask_uses_master_mask_for_preprocessing(
     assert gls_masks == [None, None]
     np.testing.assert_allclose(gls_weights[0], np.vstack([weight_m1, weight_m1]))
     np.testing.assert_allclose(gls_weights[1], np.vstack([weight_m2, weight_m2]))
+
+
+def test_fit_foreground_templates_multi_mask_threads_target_beam_window(
+    monkeypatch,
+) -> None:
+    """Pass a custom target beam through shared multi-mask preprocessing."""
+
+    target = np.tile(
+        np.array(
+            [
+                [1.0, 0.5, -0.2, 0.3],
+                [0.2, -0.3, 0.6, 1.2],
+            ],
+            dtype=np.float64,
+        ),
+        (1, 3),
+    )
+    beam_window = np.linspace(1.0, 1.4, 5)
+    template_input = ftf.DifferenceTemplateInput(
+        map_a_qu=target,
+        map_b_qu=np.zeros_like(target),
+        fwhm_in_a=0.0,
+        fwhm_in_b=0.0,
+        name="dust",
+    )
+    target_beams: list[np.ndarray | None] = []
+
+    def fake_apply_harmonic_preprocessing(
+        qu_map,
+        fwhm_in,
+        fwhm_out,
+        *,
+        beam_window_in,
+        filter_config,
+        mask,
+        nest,
+        harmonic_lmax,
+    ):
+        del fwhm_in, fwhm_out, filter_config, mask, nest, harmonic_lmax
+        target_beams.append(
+            None if beam_window_in is None else np.asarray(beam_window_in)
+        )
+        return np.asarray(qu_map, dtype=np.float64)
+
+    def fake_build_template_stack_with_lmax(
+        template_inputs,
+        *,
+        fwhm_out,
+        default_filter,
+        mask,
+        nest,
+        harmonic_lmax,
+    ):
+        del fwhm_out, default_filter, mask, nest, harmonic_lmax
+        templates = np.stack(
+            [
+                np.asarray(template_input.map_a_qu, dtype=np.float64)
+                - np.asarray(template_input.map_b_qu, dtype=np.float64)
+                for template_input in template_inputs
+            ],
+            axis=0,
+        )
+        return templates, tuple(
+            template_input.name for template_input in template_inputs
+        )
+
+    monkeypatch.setattr(
+        fit_mod, "_apply_harmonic_preprocessing", fake_apply_harmonic_preprocessing
+    )
+    monkeypatch.setattr(
+        fit_mod,
+        "_build_template_stack_with_lmax",
+        fake_build_template_stack_with_lmax,
+    )
+
+    result = ftf.fit_foreground_templates_multi_mask(
+        target_qu=target,
+        target_fwhm_in=10.0,
+        template_inputs=(template_input,),
+        weight_maps={"m1": np.ones(target.shape[1])},
+        fwhm_out=0.0,
+        master_mask=np.ones(target.shape[1]),
+        target_beam_window=beam_window,
+    )
+
+    np.testing.assert_allclose(result.fit_results["m1"].amplitudes, [1.0], atol=1e-12)
+    assert len(target_beams) == 1
+    np.testing.assert_allclose(target_beams[0], beam_window)
 
 
 def test_weighted_template_gls_supports_data_projection_vector() -> None:
@@ -579,10 +886,7 @@ def test_weighted_template_gls_supports_data_projection_vector() -> None:
     # weight map is broadcast across Q/U exactly as as_weight_map does.
     weight_qu = np.vstack([weight, weight])
     normal_matrix = np.array(
-        [
-            [np.sum(lhs[i] * weight_qu * rhs[j]) for j in range(2)]
-            for i in range(2)
-        ]
+        [[np.sum(lhs[i] * weight_qu * rhs[j]) for j in range(2)] for i in range(2)]
     )
     rhs_vector = np.array([np.sum(data[i] * weight_qu * target) for i in range(2)])
     expected = np.linalg.solve(normal_matrix, rhs_vector)
@@ -710,7 +1014,9 @@ def test_fit_foreground_templates_threads_data_projection_templates() -> None:
     np.testing.assert_allclose(result.processed_templates_data_qu[0], d3, atol=1e-12)
 
 
-def test_fit_foreground_templates_multi_mask_threads_data_projection_templates() -> None:
+def test_fit_foreground_templates_multi_mask_threads_data_projection_templates() -> (
+    None
+):
     """Apply the third stack in every per-mask solve of the multi-mask fit."""
 
     npix = 6

@@ -35,6 +35,7 @@ def bootstrap_template_amplitudes(
     fwhm_out: float,
     *,
     n_mc: int,
+    target_beam_window: npt.ArrayLike | None = None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None = None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None = None,
     target_filter: HarmonicFilter | None = None,
@@ -63,6 +64,9 @@ def bootstrap_template_amplitudes(
         Common output beam FWHM in radians.
     n_mc
         Number of Monte Carlo realizations.
+    target_beam_window
+        Optional input beam transfer function ``B_ell`` for the target map. When
+        supplied, it replaces the Gaussian beam implied by ``target_fwhm_in``.
     template_inputs_rhs
         Optional sequence of right-hand template definitions for the cross
         normal matrix.
@@ -122,6 +126,7 @@ def bootstrap_template_amplitudes(
         template_inputs=template_inputs,
         weight_map=weight_map,
         fwhm_out=fwhm_out,
+        target_beam_window=target_beam_window,
         template_inputs_rhs=template_inputs_rhs,
         template_inputs_data=template_inputs_data,
         target_filter=target_filter,
@@ -154,6 +159,7 @@ def bootstrap_template_amplitudes(
                 template_inputs=template_inputs,
                 weight_map=weight_map,
                 fwhm_out=fwhm_out,
+                target_beam_window=target_beam_window,
                 template_inputs_rhs=template_inputs_rhs,
                 template_inputs_data=template_inputs_data,
                 target_filter=target_filter,
@@ -184,6 +190,7 @@ def bootstrap_template_amplitudes(
                     template_inputs=template_inputs,
                     weight_map=weight_map,
                     fwhm_out=fwhm_out,
+                    target_beam_window=target_beam_window,
                     template_inputs_rhs=template_inputs_rhs,
                     template_inputs_data=template_inputs_data,
                     target_filter=target_filter,
@@ -225,6 +232,7 @@ def bootstrap_template_amplitudes_multi_mask(
     *,
     n_mc: int,
     master_mask: npt.ArrayLike,
+    target_beam_window: npt.ArrayLike | None = None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None = None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None = None,
     target_filter: HarmonicFilter | None = None,
@@ -264,6 +272,9 @@ def bootstrap_template_amplitudes_multi_mask(
     master_mask
         Binary or apodized mask applied to every target/template input before
         harmonic smoothing/filtering.
+    target_beam_window
+        Optional input beam transfer function ``B_ell`` for the target map. When
+        supplied, it replaces the Gaussian beam implied by ``target_fwhm_in``.
     template_inputs_rhs
         Optional sequence of right-hand template definitions for the cross
         normal matrix.
@@ -318,6 +329,7 @@ def bootstrap_template_amplitudes_multi_mask(
         weight_maps=weight_maps,
         fwhm_out=fwhm_out,
         master_mask=master_mask,
+        target_beam_window=target_beam_window,
         template_inputs_rhs=template_inputs_rhs,
         template_inputs_data=template_inputs_data,
         target_filter=target_filter,
@@ -355,6 +367,7 @@ def bootstrap_template_amplitudes_multi_mask(
                 weight_maps=weight_maps,
                 fwhm_out=fwhm_out,
                 master_mask=master_mask,
+                target_beam_window=target_beam_window,
                 template_inputs_rhs=template_inputs_rhs,
                 template_inputs_data=template_inputs_data,
                 target_filter=target_filter,
@@ -387,6 +400,7 @@ def bootstrap_template_amplitudes_multi_mask(
                     weight_maps=weight_maps,
                     fwhm_out=fwhm_out,
                     master_mask=master_mask,
+                    target_beam_window=target_beam_window,
                     template_inputs_rhs=template_inputs_rhs,
                     template_inputs_data=template_inputs_data,
                     target_filter=target_filter,
@@ -427,6 +441,7 @@ def _fit_bootstrap_draw(
     template_inputs: Sequence[DifferenceTemplateInput],
     weight_map: npt.ArrayLike,
     fwhm_out: float,
+    target_beam_window: npt.ArrayLike | None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None,
     target_filter: HarmonicFilter | None,
@@ -453,6 +468,8 @@ def _fit_bootstrap_draw(
         Diagonal pixel weight map passed through to ``fit_foreground_templates``.
     fwhm_out
         Common output beam FWHM in radians.
+    target_beam_window
+        Optional input beam transfer function for the target map.
     template_inputs_rhs
         Optional right-hand template definitions for the cross normal matrix.
     template_inputs_data
@@ -509,6 +526,7 @@ def _fit_bootstrap_draw(
         template_inputs=noisy_templates,
         weight_map=weight_map,
         fwhm_out=fwhm_out,
+        target_beam_window=target_beam_window,
         template_inputs_rhs=noisy_templates_rhs,
         template_inputs_data=noisy_templates_data,
         target_filter=target_filter,
@@ -528,6 +546,7 @@ def _fit_bootstrap_draw_multi_mask(
     weight_maps: Mapping[str, npt.ArrayLike],
     fwhm_out: float,
     master_mask: npt.ArrayLike,
+    target_beam_window: npt.ArrayLike | None,
     template_inputs_rhs: Sequence[DifferenceTemplateInput] | None,
     template_inputs_data: Sequence[DifferenceTemplateInput] | None,
     target_filter: HarmonicFilter | None,
@@ -578,6 +597,7 @@ def _fit_bootstrap_draw_multi_mask(
         weight_maps=weight_maps,
         fwhm_out=fwhm_out,
         master_mask=master_mask,
+        target_beam_window=target_beam_window,
         template_inputs_rhs=noisy_templates_rhs,
         template_inputs_data=noisy_templates_data,
         target_filter=target_filter,
